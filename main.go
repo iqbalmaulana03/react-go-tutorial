@@ -1,12 +1,15 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type Todo struct {
@@ -15,10 +18,10 @@ type Todo struct {
 	Body      string `json:"body"`
 }
 
-func main() {
-	fmt.Println("Hello Word!")
+var db *sql.DB
 
-	app := fiber.New()
+func main() {
+	fmt.Println("Starting Todo App!")
 
 	err := godotenv.Load(".env")
 
@@ -26,11 +29,21 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
+	initDB()
+	defer db.Close()
+
+	createTable()
+
+	app := fiber.New()
+
 	PORT := os.Getenv("PORT")
 
-	todos := []Todo{}
-
 	app.Get("/", func(c *fiber.Ctx) error {
+		todos, err := getAllTodos()
+
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch todos"})
+		}
 		return c.Status(200).JSON(todos)
 	})
 
@@ -45,40 +58,151 @@ func main() {
 			return c.Status(400).JSON(fiber.Map{"msg": "Todo body is required"})
 		}
 
-		todo.ID = len(todos) + 1
+		createdTodo, err := createTodo(todo.Body)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to create todo"})
+		}
 
-		todos = append(todos, *todo)
-
-		return c.Status(201).JSON(todo)
+		return c.Status(201).JSON(createdTodo)
 	})
 
 	app.Patch("/api/todos/:id", func(c *fiber.Ctx) error {
 
-		id := c.Params("id")
+		id, err := strconv.Atoi(c.Params("id"))
 
-		for i, todo := range todos {
-			if fmt.Sprint(todo.ID) == id {
-				todos[i].Completed = true
-				return c.Status(200).JSON(todos[i])
-			}
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID Format"})
 		}
 
-		return c.Status(404).JSON(fiber.Map{"error": "Todo must be valid!"})
+		updatedTodo, err := markTodoCompleted(id)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return c.Status(404).JSON(fiber.Map{"error": "Todo not found!"})
+			}
+
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to update todo"})
+		}
+
+		return c.Status(200).JSON(updatedTodo)
 	})
 
 	app.Delete("/api/todos/:id", func(c *fiber.Ctx) error {
 
-		id := c.Params("id")
+		id, err := strconv.Atoi(c.Params("id"))
 
-		for i, todo := range todos {
-			if fmt.Sprint(todo.ID) == id {
-				todos = append(todos[:i], todos[i+1:]...)
-				return c.Status(200).JSON(fiber.Map{"success": true})
-			}
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid ID Format"})
 		}
 
-		return c.Status(404).JSON(fiber.Map{"error": "Todo must be valid!"})
+		err = deleteTodo(id)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return c.Status(404).JSON(fiber.Map{"error": "Todo not found"})
+			}
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete todo"})
+		}
+
+		return c.Status(200).JSON(fiber.Map{"success": true})
 	})
 
 	log.Fatal(app.Listen(":" + PORT))
+}
+
+func initDB() {
+	var err error
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_NAME"),
+	)
+
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = db.Ping()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("Successfully connected to PostgreSQL!")
+}
+
+func createTable() {
+	query := `
+		CREATE TABLE IF NOT EXISTS todos (
+			id SERIAL PRIMARY KEY,
+			body TEXT NOT NULL,
+			completed BOOLEAN DEFAULT FALSE,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`
+
+	_, err := db.Exec(query)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func getAllTodos() ([]Todo, error) {
+	query := "SELECT id, body, completed FROM todos ORDER BY created_at DESC"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var todos []Todo
+	for rows.Next() {
+		var todo Todo
+		err := rows.Scan(&todo.ID, &todo.Body, &todo.Completed)
+		if err != nil {
+			return nil, err
+		}
+		todos = append(todos, todo)
+	}
+
+	return todos, nil
+}
+
+func createTodo(body string) (*Todo, error) {
+	query := "INSERT INTO todos (body) VALUES ($1) RETURNING id, body, completed"
+	var todo Todo
+	err := db.QueryRow(query, body).Scan(&todo.ID, &todo.Body, &todo.Completed)
+	if err != nil {
+		return nil, err
+	}
+	return &todo, nil
+}
+
+func markTodoCompleted(id int) (*Todo, error) {
+	query := "UPDATE todos SET completed = TRUE WHERE id = $1 RETURNING id, body, completed"
+	var todo Todo
+	err := db.QueryRow(query, id).Scan(&todo.ID, &todo.Body, &todo.Completed)
+	if err != nil {
+		return nil, err
+	}
+	return &todo, nil
+}
+
+func deleteTodo(id int) error {
+	query := "DELETE FROM todos WHERE id = $1"
+	result, err := db.Exec(query, id)
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
 }
