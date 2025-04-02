@@ -13,7 +13,7 @@ import (
 )
 
 type Todo struct {
-	ID        int    `json:"id"`
+	ID        int    `json:"_id,omitempty"`
 	Completed bool   `json:"completed"`
 	Body      string `json:"body"`
 }
@@ -36,9 +36,22 @@ func main() {
 
 	app := fiber.New()
 
+	// app.Use(cors.New(cors.Config{
+	// 	AllowOrigins: "http://localhost:5173",
+	// 	AllowHeaders: "Origin,Content-Type,Accept",
+	// }))
+
 	PORT := os.Getenv("PORT")
 
-	app.Get("/", func(c *fiber.Ctx) error {
+	if PORT == "" {
+		PORT = "5000"
+	}
+
+	if os.Getenv("ENV") == "production" {
+		app.Static("/", "./client/dist")
+	}
+
+	app.Get("/api/todos", func(c *fiber.Ctx) error {
 		todos, err := getAllTodos()
 
 		if err != nil {
